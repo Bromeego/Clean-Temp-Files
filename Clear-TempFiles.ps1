@@ -49,11 +49,11 @@ Function Cleanup {
     $CleanBin = Read-Host "Would you like to empty the Recycle Bin for All Users? (Y/N)"
 
     # Get the size of the Windows Updates folder (SoftwareDistribution)
-    $WUfoldersize = "{0:N2} GB" -f ((Get-ChildItem "C:\Windows\SoftwareDistribution" -Recurse | Measure-Object Length -s).sum / 1Gb)
+    $WUfoldersize = (Get-ChildItem "C:\Windows\SoftwareDistribution" -Recurse | Measure-Object Length -s).sum / 1Gb
 
     # Ask the user if they would like to clean the Windows Update folder
-    if ($WUfoldersize -gt "1.5 Gb") {
-        Write-Host "The Windows Update folder is $WUFoldersize"
+    if ($WUfoldersize -gt 1.5) {
+        Write-Host "The Windows Update folder is" ("{0:N2} GB" -f $WUFoldersize)
         $CleanWU = Read-Host "Do you want clean the Software Distribution folder and reset Windows Updates? (Y/N)"
     }
 
@@ -63,7 +63,7 @@ Function Cleanup {
     @{ Name = "Size (GB)" ; Expression = { "{0:N1}" -f ( $_.Size / 1gb) } },
     @{ Name = "FreeSpace (GB)" ; Expression = { "{0:N1}" -f ( $_.Freespace / 1gb ) } },
     @{ Name = "PercentFree" ; Expression = { "{0:P1}" -f ( $_.FreeSpace / $_.Size ) } } |
-        Format-Table -AutoSize | Out-String
+    Format-Table -AutoSize | Out-String
 
     # Define log file location
     $Cleanuplog = "C:\users\$env:USERNAME\Cleanup$LogDate.log"
@@ -382,7 +382,7 @@ Function Cleanup {
     @{ Name = "Size (GB)" ; Expression = { "{0:N1}" -f ( $_.Size / 1gb) } },
     @{ Name = "FreeSpace (GB)" ; Expression = { "{0:N1}" -f ( $_.Freespace / 1gb ) } },
     @{ Name = "PercentFree" ; Expression = { "{0:P1}" -f ( $_.FreeSpace / $_.Size ) } } |
-        Format-Table -AutoSize | Out-String
+    Format-Table -AutoSize | Out-String
 
     # Sends some before and after info for ticketing purposes
     Write-Host -ForegroundColor Green "Before: $Before"
