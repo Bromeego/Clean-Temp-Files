@@ -1,452 +1,742 @@
-#Calling Powershell as Admin and setting Execution Policy to Bypass to avoid Cannot run Scripts error
+# Calling PowerShell as Admin and setting Execution Policy to Bypass to avoid Cannot run Scripts error
 param ([switch]$Elevated)
+
 function CheckAdmin {
     $currentUser = New-Object Security.Principal.WindowsPrincipal $([Security.Principal.WindowsIdentity]::GetCurrent())
     $currentUser.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
-if ((CheckAdmin) -eq $false) {
-    if ($elevated) {
-        # could not elevate, quit
+
+function Ask-YesNo {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Question,
+
+        [ValidateSet('Y', 'N')]
+        [string]$Default = 'N'
+    )
+
+    $Answer = Read-Host "$Question (Y/N) [Default: $Default]"
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        return $Default
+    }
+
+    if ($Answer -match '^(Y|y)') {
+        return 'Y'
+    }
+
+    return 'N'
+}
+
+function Get-FolderSizeBytes {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        return 0
+    }
+
+    $Size = (Get-ChildItem -Path $Path -Recurse -Force -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+
+    if ($null -eq $Size) {
+        return 0
+    }
+
+    return [double]$Size
+}
+
+function Format-Size {
+    param (
+        [Parameter(Mandatory = $true)]
+        [double]$Bytes
+    )
+
+    if ($Bytes -ge 1GB) {
+        return ('{0:N2} GB' -f ($Bytes / 1GB))
+    }
+    elseif ($Bytes -ge 1MB) {
+        return ('{0:N2} MB' -f ($Bytes / 1MB))
+    }
+    elseif ($Bytes -ge 1KB) {
+        return ('{0:N2} KB' -f ($Bytes / 1KB))
     }
     else {
-        # Detecting Powershell (powershell.exe) or Powershell Core (pwsh), will return true if Powershell Core (pwsh)
-        if ($IsCoreCLR) { $PowerShellCmdLine = 'pwsh.exe' } else { $PowerShellCmdLine = 'powershell.exe' }
-        $CommandLine = "-noprofile -ExecutionPolicy Bypass -File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments + ' -Elevated'
+        return ('{0:N0} Bytes' -f $Bytes)
+    }
+}
+
+function Remove-FolderContents {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (Test-Path $Path) {
+        Get-ChildItem -Path $Path -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+    }
+}
+
+function Remove-OldFiles {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$OlderThan,
+
+        [string[]]$Extensions,
+
+        [string]$FullNameMatch,
+
+        [switch]$Recurse
+    )
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    $Params = @{
+        Path        = $Path
+        File        = $true
+        Force       = $true
+        ErrorAction = 'SilentlyContinue'
+    }
+
+    if ($Recurse) {
+        $Params.Recurse = $true
+    }
+
+    $Files = Get-ChildItem @Params | Where-Object { $_.LastWriteTime -lt $OlderThan }
+
+    if ($Extensions) {
+        $Files = $Files | Where-Object { $_.Extension -in $Extensions }
+    }
+
+    if ($FullNameMatch) {
+        $Files = $Files | Where-Object { $_.FullName -match $FullNameMatch }
+    }
+
+    foreach ($File in $Files) {
+        Remove-Item -Path $File.FullName -Force -ErrorAction SilentlyContinue -Verbose
+    }
+}
+
+if ((CheckAdmin) -eq $false) {
+    if ($Elevated) {
+        # Could not elevate, quit
+    }
+    else {
+        # Detecting PowerShell (powershell.exe) or PowerShell Core (pwsh)
+        if ($IsCoreCLR) {
+            $PowerShellCmdLine = 'pwsh.exe'
+        }
+        else {
+            $PowerShellCmdLine = 'powershell.exe'
+        }
+
+        $CommandLine = "-NoProfile -ExecutionPolicy Bypass -File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments + ' -Elevated'
         Start-Process "$PSHOME\$PowerShellCmdLine" -Verb RunAs -ArgumentList $CommandLine
     }
+
     exit
 }
 
 # Rename Title Window
-$host.ui.RawUI.WindowTitle = 'Clean Browser Temp Files'
+$host.UI.RawUI.WindowTitle = 'Clean Temp Files'
 
 function Cleanup {
     # Set Date for Log
     $LogDate = Get-Date -Format 'MM-d-yy-HHmm'
 
-    # Ask for confirmation to delete users Downloaded files - Anything older than 90 days
-    $DeleteOldDownloads = Read-Host 'Would you like to delete files older than 90 days in the Downloads folder for All Users? (Y/N)'
-    
-    # Set Deletion Date for Downloads Folder
+    # Set Deletion Dates
     $DelDownloadsDate = (Get-Date).AddDays(-90)
-
-    # Set Deletion Date for Inetpub Log Folder
     $DelInetLogDate = (Get-Date).AddDays(-30)
-
-    # Set Deletion Date for System32 Log Folder
     $System32LogDate = (Get-Date).AddMonths(-2)
-
-    # Set Deletion Date for Azure Logs Folder
     $DelAZLogDate = (Get-Date).AddDays(-7)
-
-    # Set Deletion Date for Office File Cache Folder
     $DelOfficeCacheDate = (Get-Date).AddDays(-7)
-
-    # Set Deletion Date for LFSAgent Logs Folder
-    $DelLFSAGentLogDate = (Get-Date).AddDays(-30)
-
-    # Set Deletion Date for SotiMobicontroller Logs
+    $DelLFSAgentLogDate = (Get-Date).AddDays(-30)
     $DelSotiLogDate = (Get-Date).AddYears(-1)
+    $DelCBSLogDate = (Get-Date).AddDays(-14)
+    $DelPantherLogDate = (Get-Date).AddDays(-30)
+    $DelFailedReqLogDate = (Get-Date).AddDays(-30)
 
-    # Ask for Confirmation to Empty Recycle Bin for All Users
-    $CleanBin = Read-Host 'Would you like to empty the Recycle Bin for All Users? (Y/N)'
+    # Prompt options
+    $DeleteOldDownloads = Ask-YesNo -Question 'Would you like to delete files older than 90 days in the Downloads folder for All Users?' -Default 'N'
+    $CleanBin = Ask-YesNo -Question 'Would you like to empty the Recycle Bin for All Users?' -Default 'N'
+    $CloseBrowsers = Ask-YesNo -Question 'Would you like to close Edge/Chrome/Firefox before cleaning browser cache?' -Default 'N'
+    $CleanPrintSpooler = Ask-YesNo -Question 'Would you like to clear the print spooler queue? This will remove stuck print jobs' -Default 'N'
 
-    # Get the size of the Windows Updates folder (SoftwareDistribution)
-    $WUfoldersize = (Get-ChildItem "$env:windir\SoftwareDistribution" -Recurse | Measure-Object Length -s).sum / 1Gb
+    # C:\Temp handling. Only ask if the folder exists and is larger than 500MB.
+    $CleanCTemp = 'N'
+    $CTempPath = 'C:\Temp'
 
-    # Ask the user if they would like to clean the Windows Update folder
-    if ($WUfoldersize -gt 1.5) {
-        Write-Host 'The Windows Update folder is' ('{0:N2} GB' -f $WUFoldersize)
-        $CleanWU = Read-Host 'Do you want clean the Software Distribution folder and reset Windows Updates? (Y/N)'
+    if (Test-Path $CTempPath) {
+        $CTempSizeBytes = Get-FolderSizeBytes -Path $CTempPath
+        $CTempSizeFormatted = Format-Size -Bytes $CTempSizeBytes
+
+        if ($CTempSizeBytes -gt 500MB) {
+            Write-Host -ForegroundColor Yellow "$CTempPath currently contains approximately $CTempSizeFormatted."
+            $CleanCTemp = Ask-YesNo -Question "Would you like to clean $CTempPath?" -Default 'N'
+        }
+        else {
+            Write-Host -ForegroundColor Cyan "$CTempPath exists but is only approximately $CTempSizeFormatted. Skipping $CTempPath cleanup."
+        }
+    }
+    else {
+        Write-Host -ForegroundColor Cyan "$CTempPath does not exist. Skipping $CTempPath cleanup."
     }
 
-    # Get Disk Size
-    $Before = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -eq '3' } | Select-Object SystemName,
-    @{ Name = 'Drive' ; Expression = { ( $_.DeviceID ) } },
-    @{ Name = 'Size (GB)' ; Expression = { '{0:N1}' -f ( $_.Size / 1gb) } },
-    @{ Name = 'FreeSpace (GB)' ; Expression = { '{0:N1}' -f ( $_.Freespace / 1gb ) } },
-    @{ Name = 'PercentFree' ; Expression = { '{0:P1}' -f ( $_.FreeSpace / $_.Size ) } } |
-        Format-Table -AutoSize | Out-String
+    # Ask the user if they would like to clean the Windows Update folder
+    $CleanWU = 'N'
+
+    if (Test-Path "$env:windir\SoftwareDistribution") {
+        $WUFolderSizeBytes = Get-FolderSizeBytes -Path "$env:windir\SoftwareDistribution"
+
+        if ($WUFolderSizeBytes -gt 1.5GB) {
+            Write-Host "The Windows Update folder is $(Format-Size -Bytes $WUFolderSizeBytes)"
+            $CleanWU = Ask-YesNo -Question 'Do you want to clean the Software Distribution folder and reset Windows Updates?' -Default 'N'
+        }
+    }
+
+    # Windows.old prompt
+    $CleanWindowsOld = 'N'
+
+    if (Test-Path 'C:\Windows.old') {
+        $WindowsOldSizeBytes = Get-FolderSizeBytes -Path 'C:\Windows.old'
+        Write-Host -ForegroundColor Yellow "C:\Windows.old exists and is approximately $(Format-Size -Bytes $WindowsOldSizeBytes)."
+        Write-Host -ForegroundColor Yellow 'Deleting this may prevent rollback to a previous Windows version.'
+        $CleanWindowsOld = Ask-YesNo -Question 'Would you like to delete C:\Windows.old?' -Default 'N'
+    }
+
+    # Get Disk Size Before
+    $Before = Get-WmiObject Win32_LogicalDisk |
+        Where-Object { $_.DriveType -eq '3' } |
+            Select-Object SystemName,
+            @{ Name = 'Drive'; Expression = { $_.DeviceID } },
+            @{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($_.Size / 1GB) } },
+            @{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($_.FreeSpace / 1GB) } },
+            @{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($_.FreeSpace / $_.Size) } } |
+                Format-Table -AutoSize |
+                    Out-String
 
     # Define log file location
-    $Cleanuplog = "$env:USERPROFILE\Cleanup$LogDate.log"
+    $CleanupLog = "$env:USERPROFILE\Cleanup$LogDate.log"
 
     # Start Logging
     Start-Transcript -Path "$CleanupLog"
 
     # Create list of users
     Write-Host -ForegroundColor Green "Getting the list of Users`n"
-    $Users = Get-ChildItem 'C:\Users' | Select-Object Name
-    $users = $Users.Name 
 
-    # Begin!
+    $ExcludedUsers = @(
+        'Public',
+        'Default',
+        'Default User',
+        'All Users',
+        'defaultuser0'
+    )
+
+    $Users = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $ExcludedUsers -notcontains $_.Name } |
+            Select-Object -ExpandProperty Name
+
+    # Begin
     Write-Host -ForegroundColor Green "Beginning Script...`n"
+
+    if ($CloseBrowsers -eq 'Y') {
+        Write-Host -ForegroundColor Yellow "Closing Edge, Chrome, and Firefox`n"
+        taskkill /F /IM msedge.exe 2>$null
+        taskkill /F /IM chrome.exe 2>$null
+        taskkill /F /IM firefox.exe 2>$null
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
 
     # Clear Firefox Cache
     Write-Host -ForegroundColor Green "Clearing Firefox Cache`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\cache2\entries\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\thumbnails\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\cookies.sqlite" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\webappsstore.sqlite" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\chromeappsstore.sqlite" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Mozilla\Firefox\Profiles\*\OfflineCache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        }
-        Write-Host -ForegroundColor Yellow "Done...`n"
-    }
-    # Clear Google Chrome
-    Write-Host -ForegroundColor Green "Clearing Google Chrome Cache`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\Cache2\entries\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\Cookies" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\Media Cache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\Cookies-Journal" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\JumpListIconsOld" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            # Comment out the following line to remove the Chrome Write Font Cache too.
-            # Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\Default\ChromeDWriteFontCache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+    foreach ($User in $Users) {
+        $FirefoxProfilePath = "C:\Users\$User\AppData\Local\Mozilla\Firefox\Profiles"
 
-            # Check Chrome Profiles. It looks as though when creating profiles, it just numbers them Profile 1, Profile 2 etc.
-            $Profiles = Get-ChildItem -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data" | Select-Object Name | Where-Object Name -Like 'Profile*'
-            foreach ($Account in $Profiles) {
-                $Account = $Account.Name 
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\$Account\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\$Account\Cache2\entries\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose 
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\$Account\Cookies" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\$Account\Media Cache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\$Account\Cookies-Journal" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Google\Chrome\User Data\$Account\JumpListIconsOld" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            }
-        }
-        Write-Host -ForegroundColor Yellow "Done...`n"
-    }
+        if (Test-Path $FirefoxProfilePath) {
+            Remove-FolderContents -Path "$FirefoxProfilePath\*\cache"
+            Remove-FolderContents -Path "$FirefoxProfilePath\*\cache2\entries"
+            Remove-FolderContents -Path "$FirefoxProfilePath\*\thumbnails"
+            Remove-FolderContents -Path "$FirefoxProfilePath\*\OfflineCache"
 
-    # Clear Internet Explorer & Edge
-    Write-Host -ForegroundColor Yellow "Clearing Internet Explorer & Old Edge Cache`n"
-    foreach ($user in $Users) {
-        Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Windows\Temporary Internet Files\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Windows\INetCache\* " -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Windows\WebCache\* " -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+            # Skipping Firefox cookies/local storage to avoid signing users out of websites:
+            # cookies.sqlite
+            # webappsstore.sqlite
+            # chromeappsstore.sqlite
+        }
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
-    # Clear Edge Chromium
-    Write-Host -ForegroundColor Yellow "Clearing Edge Chromium Cache`n"
-    taskkill /F /IM msedge.exe
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            #Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\Cache2\entries\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\Cookies" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            #Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\Media Cache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\Cookies-Journal" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            #Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\JumpListIconsOld" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            # Comment out the following line to remove the Edge Write Font Cache too.
-            # Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\Default\EdgeDWriteFontCache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        
-            # Check Edge Profiles. It looks as though when creating profiles, it just numbers them Profile 1, Profile 2 etc.
-            $Profiles = Get-ChildItem -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data" | Select-Object Name | Where-Object Name -Like 'Profile*'
-            foreach ($Account in $Profiles) {
-                $Account = $Account.Name 
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\$Account\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                #Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\$Account\Cache2\entries\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose 
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\$Account\Cookies" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                #Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\$Account\Media Cache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\$Account\Cookies-Journal" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-                #Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Edge\User Data\$Account\JumpListIconsOld" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+    # Clear Google Chrome Cache
+    Write-Host -ForegroundColor Green "Clearing Google Chrome Cache`n"
+    foreach ($User in $Users) {
+        $ChromeUserData = "C:\Users\$User\AppData\Local\Google\Chrome\User Data"
+
+        if (Test-Path $ChromeUserData) {
+            Remove-FolderContents -Path "$ChromeUserData\Default\Cache"
+            Remove-FolderContents -Path "$ChromeUserData\Default\Cache2\entries"
+            Remove-FolderContents -Path "$ChromeUserData\Default\Media Cache"
+            Remove-FolderContents -Path "$ChromeUserData\Default\JumpListIconsOld"
+
+            # Skipping Chrome Cookies and Cookies-Journal to avoid signing users out of websites.
+
+            # Comment out the following line to remove the Chrome Write Font Cache too.
+            # Remove-FolderContents -Path "$ChromeUserData\Default\ChromeDWriteFontCache"
+
+            # Check Chrome Profiles. It looks as though when creating profiles, it just numbers them Profile 1, Profile 2 etc.
+            $Profiles = Get-ChildItem -Path $ChromeUserData -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like 'Profile*' }
+
+            foreach ($BrowserProfile in $Profiles) {
+                Remove-FolderContents -Path "$ChromeUserData\$($BrowserProfile.Name)\Cache"
+                Remove-FolderContents -Path "$ChromeUserData\$($BrowserProfile.Name)\Cache2\entries"
+                Remove-FolderContents -Path "$ChromeUserData\$($BrowserProfile.Name)\Media Cache"
+                Remove-FolderContents -Path "$ChromeUserData\$($BrowserProfile.Name)\JumpListIconsOld"
+
+                # Skipping Chrome profile Cookies and Cookies-Journal to avoid signing users out of websites.
             }
         }
-        Write-Host -ForegroundColor Yellow "Done...`n" 
     }
-    
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
+    # Clear Internet Explorer & Old Edge Cache
+    Write-Host -ForegroundColor Yellow "Clearing Internet Explorer & Old Edge Cache`n"
+    foreach ($User in $Users) {
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\Microsoft\Windows\Temporary Internet Files"
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\Microsoft\Windows\INetCache"
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\Microsoft\Windows\WebCache"
+    }
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
+    # Clear Edge Chromium Cache
+    Write-Host -ForegroundColor Yellow "Clearing Edge Chromium Cache`n"
+    foreach ($User in $Users) {
+        $EdgeUserData = "C:\Users\$User\AppData\Local\Microsoft\Edge\User Data"
+
+        if (Test-Path $EdgeUserData) {
+            Remove-FolderContents -Path "$EdgeUserData\Default\Cache"
+
+            # Skipping Edge Cookies and Cookies-Journal to avoid signing users out of websites.
+
+            # Comment out the following line to remove the Edge Write Font Cache too.
+            # Remove-FolderContents -Path "$EdgeUserData\Default\EdgeDWriteFontCache"
+
+            # Check Edge Profiles. It looks as though when creating profiles, it just numbers them Profile 1, Profile 2 etc.
+            $Profiles = Get-ChildItem -Path $EdgeUserData -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like 'Profile*' }
+
+            foreach ($BrowserProfile in $Profiles) {
+                Remove-FolderContents -Path "$EdgeUserData\$($BrowserProfile.Name)\Cache"
+
+                # Skipping Edge profile Cookies and Cookies-Journal to avoid signing users out of websites.
+            }
+        }
+    }
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
     # Clear Chromium
     Write-Host -ForegroundColor Yellow "Clearing Chromium Cache`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Chromium") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Chromium\User Data\Default\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Chromium\User Data\Default\GPUCache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Chromium\User Data\Default\Media Cache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Chromium\User Data\Default\Pepper Data" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Chromium\User Data\Default\Application Cache" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+    foreach ($User in $Users) {
+        $ChromiumPath = "C:\Users\$User\AppData\Local\Chromium\User Data\Default"
+
+        if (Test-Path $ChromiumPath) {
+            Remove-FolderContents -Path "$ChromiumPath\Cache"
+            Remove-FolderContents -Path "$ChromiumPath\GPUCache"
+            Remove-FolderContents -Path "$ChromiumPath\Media Cache"
+            Remove-FolderContents -Path "$ChromiumPath\Pepper Data"
+            Remove-FolderContents -Path "$ChromiumPath\Application Cache"
         }
-        Write-Host -ForegroundColor Yellow "Done...`n" 
     }
-    
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
     # Clear Opera
     Write-Host -ForegroundColor Yellow "Clearing Opera Cache`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Opera Software") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Opera Software\Opera Stable\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        } 
-        Write-Host -ForegroundColor Yellow "Done...`n"
+    foreach ($User in $Users) {
+        $OperaCache = "C:\Users\$User\AppData\Local\Opera Software\Opera Stable\Cache"
+        Remove-FolderContents -Path $OperaCache
     }
+    Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Clear Yandex
     Write-Host -ForegroundColor Yellow "Clearing Yandex Cache`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Yandex") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Yandex\YandexBrowser\User Data\Default\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Yandex\YandexBrowser\User Data\Default\GPUCache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Yandex\YandexBrowser\User Data\Default\Media Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Yandex\YandexBrowser\User Data\Default\Pepper Data\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Yandex\YandexBrowser\User Data\Default\Application Cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Yandex\YandexBrowser\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        } 
-        Write-Host -ForegroundColor Yellow "Done...`n"
+    foreach ($User in $Users) {
+        $YandexPath = "C:\Users\$User\AppData\Local\Yandex\YandexBrowser\User Data\Default"
+        $YandexTemp = "C:\Users\$User\AppData\Local\Yandex\YandexBrowser\Temp"
+
+        if (Test-Path $YandexPath) {
+            Remove-FolderContents -Path "$YandexPath\Cache"
+            Remove-FolderContents -Path "$YandexPath\GPUCache"
+            Remove-FolderContents -Path "$YandexPath\Media Cache"
+            Remove-FolderContents -Path "$YandexPath\Pepper Data"
+            Remove-FolderContents -Path "$YandexPath\Application Cache"
+        }
+
+        Remove-FolderContents -Path $YandexTemp
     }
+    Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Clear User Temp Folders
     Write-Host -ForegroundColor Yellow "Clearing User Temp Folders`n"
-    foreach ($user in $Users) {
-        Remove-Item -Path "C:\Users\$user\AppData\Local\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Windows\WER\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Windows\AppCache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "C:\Users\$user\AppData\Local\CrashDumps\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+    foreach ($User in $Users) {
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\Temp"
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\Microsoft\Windows\WER"
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\Microsoft\Windows\AppCache"
+        Remove-FolderContents -Path "C:\Users\$User\AppData\Local\CrashDumps"
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
-    # Clear Windows Temp Folder
-    Write-Host -ForegroundColor Yellow "Clearing Windows Temp Folder`n"
-    foreach ($user in $Users) {
-        Remove-Item -Path 'C:\Temp\*' -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "$env:windir\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "$env:windir\Logs\CBS\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Remove-Item -Path "$env:ProgramData\Microsoft\Windows\WER\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        # Only grab log files sitting in the root of the Logfiles directory
-        $Sys32Files = Get-ChildItem -Path "$env:windir\System32\LogFiles" | Where-Object { ($_.name -like '*.log') -and ($_.lastwritetime -lt $System32LogDate) }
-        foreach ($File in $Sys32Files) {
-            Remove-Item -Path "$env:windir\System32\LogFiles\$($file.name)" -Force -ErrorAction SilentlyContinue -Verbose
+
+    # Clear Windows Temp Folders
+    Write-Host -ForegroundColor Yellow "Clearing Windows Temp Folders`n"
+
+    if ($CleanCTemp -eq 'Y') {
+        if (Test-Path $CTempPath) {
+            Write-Host -ForegroundColor Yellow "Clearing $CTempPath`n"
+            Remove-FolderContents -Path $CTempPath
+        }
+        else {
+            Write-Host -ForegroundColor Cyan "$CTempPath does not exist. Skipping $CTempPath cleanup.`n"
         }
     }
-    Write-Host -ForegroundColor Yellow "Done...`n"          
+    else {
+        Write-Host -ForegroundColor Cyan "Skipping $CTempPath cleanup`n"
+    }
+
+    Remove-FolderContents -Path "$env:windir\Temp"
+    Remove-FolderContents -Path "$env:ProgramData\Microsoft\Windows\WER"
+
+    # CBS logs can be actively used, so only delete older files.
+    if (Test-Path "$env:windir\Logs\CBS") {
+        Write-Host -ForegroundColor Yellow "Deleting CBS logs older than 14 days`n"
+        Remove-OldFiles -Path "$env:windir\Logs\CBS" -OlderThan $DelCBSLogDate -Recurse
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    # Only grab log files sitting in the root of the LogFiles directory
+    Remove-OldFiles -Path "$env:windir\System32\LogFiles" -OlderThan $System32LogDate -Extensions '.log'
+
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
+    # Clear Delivery Optimization Cache
+    $DeliveryOptimizationPath = "$env:windir\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
+
+    if (Test-Path $DeliveryOptimizationPath) {
+        Write-Host -ForegroundColor Yellow "Clearing Delivery Optimization Cache`n"
+        Remove-FolderContents -Path $DeliveryOptimizationPath
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    # Clear Windows memory dump files
+    Write-Host -ForegroundColor Yellow "Clearing Windows memory dump files`n"
+    Remove-Item -Path "$env:windir\MEMORY.DMP" -Force -ErrorAction SilentlyContinue -Verbose
+    Remove-FolderContents -Path "$env:windir\Minidump"
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
+    # Clear old Windows setup / Panther logs
+    Write-Host -ForegroundColor Yellow "Clearing old Windows setup / Panther logs`n"
+
+    $PantherPaths = @(
+        "$env:windir\Panther",
+        "$env:windir\inf"
+    )
+
+    foreach ($Path in $PantherPaths) {
+        if (Test-Path $Path) {
+            Remove-OldFiles -Path $Path -OlderThan $DelPantherLogDate -Extensions '.log', '.etl'
+        }
+    }
+
+    Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Clear Inetpub Logs Folder
     if (Test-Path 'C:\inetpub\logs\LogFiles\') {
         Write-Host -ForegroundColor Yellow "Clearing Inetpub Logs Folder`n"
-        $Folders = Get-ChildItem -Path 'C:\inetpub\logs\LogFiles\' | Select-Object Name
-        foreach ($Folder in $Folders) {
-            $folder = $Folder.Name
-            Remove-Item -Path "C:\inetpub\logs\LogFiles\$Folder\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose | Where-Object LastWriteTime -LT $DelInetLogDate
-        }
-        Write-Host -ForegroundColor Yellow "Done...`n" 
+        Remove-OldFiles -Path 'C:\inetpub\logs\LogFiles\' -OlderThan $DelInetLogDate -Recurse
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    # Clear IIS Failed Request Logs Folder
+    if (Test-Path 'C:\inetpub\logs\FailedReqLogFiles') {
+        Write-Host -ForegroundColor Yellow "Clearing IIS Failed Request Logs older than 30 days`n"
+        Remove-OldFiles -Path 'C:\inetpub\logs\FailedReqLogFiles' -OlderThan $DelFailedReqLogDate -Recurse
+        Write-Host -ForegroundColor Yellow "Done...`n"
     }
 
     # Delete Microsoft Teams Previous Version files
-    Write-Host -ForegroundColor Yellow "Clearing Teams Previous version`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\Microsoft\Teams\") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Teams\previous\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\AppData\Local\Microsoft\Teams\stage\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        } 
+    Write-Host -ForegroundColor Yellow "Clearing Teams Previous Version`n"
+    foreach ($User in $Users) {
+        $TeamsPath = "C:\Users\$User\AppData\Local\Microsoft\Teams"
+
+        if (Test-Path $TeamsPath) {
+            Remove-FolderContents -Path "$TeamsPath\previous"
+            Remove-FolderContents -Path "$TeamsPath\stage"
+        }
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Delete SnagIt Crash Dump files
     Write-Host -ForegroundColor Yellow "Clearing SnagIt Crash Dumps`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\AppData\Local\TechSmith\SnagIt") {
-            Remove-Item -Path "C:\Users\$user\AppData\Local\TechSmith\SnagIt\CrashDumps\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        } 
+    foreach ($User in $Users) {
+        $SnagitPath = "C:\Users\$User\AppData\Local\TechSmith\SnagIt"
+
+        if (Test-Path $SnagitPath) {
+            Remove-FolderContents -Path "$SnagitPath\CrashDumps"
+        }
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Clear Dropbox
     Write-Host -ForegroundColor Yellow "Clearing Dropbox Cache`n"
-    foreach ($user in $Users) {
-        if (Test-Path "C:\Users\$user\Dropbox\") {
-            Remove-Item -Path "C:\Users\$user\Dropbox\.dropbox.cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-            Remove-Item -Path "C:\Users\$user\Dropbox*\.dropbox.cache\*" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        }
+    foreach ($User in $Users) {
+        Remove-FolderContents -Path "C:\Users\$User\Dropbox\.dropbox.cache"
+        Remove-FolderContents -Path "C:\Users\$User\Dropbox*\.dropbox.cache"
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Clear HP Support Assistant Installation Folder
     if (Test-Path 'C:\swsetup') {
-        Remove-Item -Path 'C:\swsetup' -Force -ErrorAction SilentlyContinue -Verbose
-    } 
+        Write-Host -ForegroundColor Yellow "Clearing HP Support Assistant Installation Folder C:\swsetup`n"
+        Remove-Item -Path 'C:\swsetup' -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    # Clear HP Support Framework SoftPaq Cache
+    $HPSoftPaqPath = 'C:\ProgramData\HP\HP Support Framework\Softpaq'
+
+    if (Test-Path $HPSoftPaqPath) {
+        Write-Host -ForegroundColor Yellow "Clearing HP Support Framework SoftPaq Cache`n"
+
+        # Keep the SoftPaq folder itself, but remove any files/folders inside it.
+        Remove-FolderContents -Path $HPSoftPaqPath
+
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
 
     # Delete files older than 90 days from Downloads folder
-    if ($DeleteOldDownloads -eq 'Y') { 
+    if ($DeleteOldDownloads -eq 'Y') {
         Write-Host -ForegroundColor Yellow "Deleting files older than 90 days from User Downloads folder`n"
-        foreach ($user in $Users) {
-            $UserDownloads = "C:\Users\$user\Downloads"
-            $OldFiles = Get-ChildItem -Path "$UserDownloads\" -Recurse -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -LT $DelDownloadsDate
-            foreach ($file in $OldFiles) {
-                Remove-Item -Path "$UserDownloads\$file" -Force -ErrorAction SilentlyContinue -Verbose
+
+        foreach ($User in $Users) {
+            $UserDownloads = "C:\Users\$User\Downloads"
+
+            if (Test-Path $UserDownloads) {
+                Remove-OldFiles -Path $UserDownloads -OlderThan $DelDownloadsDate -Recurse
             }
         }
+
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
 
     # Delete files older than 7 days from Azure Log folder
     if (Test-Path 'C:\WindowsAzure\Logs') {
         Write-Host -ForegroundColor Yellow "Deleting files older than 7 days from Azure Log folder`n"
-        $AzureLogs = 'C:\WindowsAzure\Logs'
-        $OldFiles = Get-ChildItem -Path "$AzureLogs\" -Recurse -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -LT $DelAZLogDate
-        foreach ($file in $OldFiles) {
-            Remove-Item -Path "$AzureLogs\$file" -Force -ErrorAction SilentlyContinue -Verbose
-        }
+        Remove-OldFiles -Path 'C:\WindowsAzure\Logs' -OlderThan $DelAZLogDate -Recurse
         Write-Host -ForegroundColor Yellow "Done...`n"
-    } 
+    }
 
     # Delete files older than 7 days from Office Cache Folder
     Write-Host -ForegroundColor Yellow "Clearing Office Cache Folder`n"
-    foreach ($user in $Users) {
-        $officecache = "C:\Users\$user\AppData\Local\Microsoft\Office\16.0\GrooveFileCache"
-        if (Test-Path $officecache) {
-            $OldFiles = Get-ChildItem -Path "$officecache\" -Recurse -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -LT $DelOfficeCacheDate 
-            foreach ($file in $OldFiles) {
-                Remove-Item -Path "$officecache\$file" -Force -ErrorAction SilentlyContinue -Verbose
-            }
-        } 
+    foreach ($User in $Users) {
+        $OfficeCache = "C:\Users\$User\AppData\Local\Microsoft\Office\16.0\GrooveFileCache"
+
+        if (Test-Path $OfficeCache) {
+            Remove-OldFiles -Path $OfficeCache -OlderThan $DelOfficeCacheDate -Recurse
+        }
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Delete files older than 30 days from LFSAgent Log folder https://www.lepide.com/
     if (Test-Path "$env:windir\LFSAgent\Logs") {
         Write-Host -ForegroundColor Yellow "Deleting files older than 30 days from LFSAgent Log folder`n"
-        $LFSAgentLogs = "$env:windir\LFSAgent\Logs"
-        $OldFiles = Get-ChildItem -Path "$LFSAgentLogs\" -Recurse -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -LT $DelLFSAGentLogDate
-        foreach ($file in $OldFiles) {
-            Remove-Item -Path "$LFSAgentLogs\$file" -Force -ErrorAction SilentlyContinue -Verbose
-        }
+        Remove-OldFiles -Path "$env:windir\LFSAgent\Logs" -OlderThan $DelLFSAgentLogDate -Recurse
         Write-Host -ForegroundColor Yellow "Done...`n"
-    }         
+    }
 
     # Delete SOTI MobiController Log files older than 1 year
     if (Test-Path 'C:\Program Files (x86)\SOTI\MobiControl') {
         Write-Host -ForegroundColor Yellow "Deleting SOTI MobiController Log files older than 1 year`n"
-        $SotiLogFiles = Get-ChildItem -Path 'C:\Program Files (x86)\SOTI\MobiControl' | Where-Object { ($_.name -like '*Device*.log' -or $_.name -like '*Server*.log' ) -and ($_.lastwritetime -lt $DelSotiLogDate) }
+
+        $SotiLogFiles = Get-ChildItem -Path 'C:\Program Files (x86)\SOTI\MobiControl' -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.Name -like '*Device*.log' -or $_.Name -like '*Server*.log') -and
+                ($_.LastWriteTime -lt $DelSotiLogDate)
+            }
+
         foreach ($File in $SotiLogFiles) {
-            Remove-Item -Path "C:\Program Files (x86)\SOTI\MobiControl\$($file.name)" -Force -ErrorAction SilentlyContinue -Verbose
+            Remove-Item -Path $File.FullName -Force -ErrorAction SilentlyContinue -Verbose
         }
+
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
 
     # Delete old Cylance Log files
     if (Test-Path 'C:\Program Files\Cylance\Desktop') {
         Write-Host -ForegroundColor Yellow "Deleting Old Cylance Log files`n"
-        $OldCylanceLogFiles = Get-ChildItem -Path 'C:\Program Files\Cylance\Desktop' | Where-Object name -Like 'cylog-*.log'
+
+        $OldCylanceLogFiles = Get-ChildItem -Path 'C:\Program Files\Cylance\Desktop' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'cylog-*.log' }
+
         foreach ($File in $OldCylanceLogFiles) {
-            Remove-Item -Path "C:\Program Files\Cylance\Desktop\$($file.name)" -Force -ErrorAction SilentlyContinue -Verbose
+            Remove-Item -Path $File.FullName -Force -ErrorAction SilentlyContinue -Verbose
         }
+
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
 
-    # Delete Windows Updates Folder (SoftwareDistribution) and reset the Windows Update Service
-    if ($CleanWU -eq 'Y') { 
-        Write-Host -ForegroundColor Yellow "Restarting Windows Update Service and Deleting SoftwareDistribution Folder`n"
-        # Stop the Windows Update service
-        try {
-            Stop-Service -Name wuauserv
-        }
-        catch {
-            $ErrorMessage = $_.Exception.Message
-            Write-Warning "$ErrorMessage" 
-        }
-        # Delete the folder
-        Remove-Item "$env:windir\SoftwareDistribution" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
-        Start-Sleep -s 3
+    # Clear print spooler queue if requested
+    if ($CleanPrintSpooler -eq 'Y') {
+        Write-Host -ForegroundColor Yellow "Clearing print spooler queue`n"
 
-        # Start the Windows Update service
         try {
-            Start-Service -Name wuauserv
+            Stop-Service Spooler -Force -ErrorAction Stop
+            Remove-FolderContents -Path "$env:windir\System32\spool\PRINTERS"
+            Start-Service Spooler -ErrorAction Stop
         }
         catch {
             $ErrorMessage = $_.Exception.Message
-            Write-Warning "$ErrorMessage" 
+            Write-Warning "$ErrorMessage"
+
+            try {
+                Start-Service Spooler -ErrorAction SilentlyContinue
+            }
+            catch {
+                # Ignore secondary failure
+            }
         }
+
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    # Delete Windows.old if requested
+    if ($CleanWindowsOld -eq 'Y') {
+        if (Test-Path 'C:\Windows.old') {
+            Write-Host -ForegroundColor Yellow "Deleting C:\Windows.old`n"
+            Remove-Item -Path 'C:\Windows.old' -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+            Write-Host -ForegroundColor Yellow "Done...`n"
+        }
+    }
+
+    # Delete Windows Updates Folder SoftwareDistribution and reset the Windows Update Service
+    if ($CleanWU -eq 'Y') {
+        Write-Host -ForegroundColor Yellow "Restarting Windows Update Service and Deleting SoftwareDistribution Folder`n"
+
+        try {
+            Stop-Service -Name wuauserv -Force -ErrorAction Stop
+        }
+        catch {
+            $ErrorMessage = $_.Exception.Message
+            Write-Warning "$ErrorMessage"
+        }
+
+        Remove-Item "$env:windir\SoftwareDistribution" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+        Start-Sleep -Seconds 3
+
+        try {
+            Start-Service -Name wuauserv -ErrorAction Stop
+        }
+        catch {
+            $ErrorMessage = $_.Exception.Message
+            Write-Warning "$ErrorMessage"
+        }
+
         Write-Host -ForegroundColor Yellow 'Done...'
-        Write-Host -ForegroundColor Yellow "Please rerun Windows Update to pull down the latest updates `n"
+        Write-Host -ForegroundColor Yellow "Please rerun Windows Update to pull down the latest updates`n"
     }
 
     # Empty Recycle Bin
-    if ($Cleanbin -eq 'Y') {
+    if ($CleanBin -eq 'Y') {
         Write-Host -ForegroundColor Green "Cleaning Recycle Bin`n"
-        $ErrorActionPreference = 'SilentlyContinue'
+
         $RecycleBin = "C:\`$Recycle.Bin"
-        $BinFolders = Get-ChildItem $RecycleBin -Directory -Force
+        $BinFolders = Get-ChildItem $RecycleBin -Directory -Force -ErrorAction SilentlyContinue
 
         foreach ($Folder in $BinFolders) {
             # Translate the SID to a User Account
-            $objSID = New-Object System.Security.Principal.SecurityIdentifier ($folder)
             try {
-                $objUser = $objSID.Translate( [System.Security.Principal.NTAccount])
-                Write-Host -Foreground Yellow -Background Black "Cleaning $objUser Recycle Bin"
+                $ObjSID = New-Object System.Security.Principal.SecurityIdentifier ($Folder.Name)
+                $ObjUser = $ObjSID.Translate([System.Security.Principal.NTAccount])
+                Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
             }
-            # If SID cannot be Translated, Throw out the SID instead of error
             catch {
-                $objUser = $objSID.Value
-                Write-Host -Foreground Yellow -Background Black "$objUser"
+                $ObjUser = $Folder.Name
+                Write-Host -ForegroundColor Yellow -BackgroundColor Black "$ObjUser"
             }
+
             $Files = @()
 
-            if ($PSVersionTable.PSVersion -like '*2*') {
-                $Files = Get-ChildItem $Folder.FullName -Recurse -Force
+            if ($PSVersionTable.PSVersion.Major -eq 2) {
+                $Files = Get-ChildItem $Folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
             }
             else {
-                $Files = Get-ChildItem $Folder.FullName -File -Recurse -Force
-                $Files += Get-ChildItem $Folder.FullName -Directory -Recurse -Force
+                $Files = Get-ChildItem $Folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue
+                $Files += Get-ChildItem $Folder.FullName -Directory -Recurse -Force -ErrorAction SilentlyContinue
             }
 
             $FileTotal = $Files.Count
 
             for ($i = 1; $i -le $Files.Count; $i++) {
                 $FileName = Select-Object -InputObject $Files[($i - 1)]
-                Write-Progress -Activity 'Recycle Bin Clean-up' -Status "Attempting to Delete File [$i / $FileTotal]: $FileName" -PercentComplete (($i / $Files.count) * 100) -Id 1
-                Remove-Item -Path $Files[($i - 1)].FullName -Recurse -Force
+                Write-Progress -Activity 'Recycle Bin Clean-up' -Status "Attempting to Delete File [$i / $FileTotal]: $FileName" -PercentComplete (($i / $Files.Count) * 100) -Id 1
+                Remove-Item -Path $Files[($i - 1)].FullName -Recurse -Force -ErrorAction SilentlyContinue
             }
+
             Write-Progress -Activity 'Recycle Bin Clean-up' -Status 'Complete' -Completed -Id 1
         }
+
         Write-Host -ForegroundColor Green "Done`n `n"
     }
 
     Write-Host -ForegroundColor Green "All Tasks Done!`n`n"
 
-
     # Get Drive size after clean
-    $After = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -eq '3' } | Select-Object SystemName,
-    @{ Name = 'Drive' ; Expression = { ( $_.DeviceID ) } },
-    @{ Name = 'Size (GB)' ; Expression = { '{0:N1}' -f ( $_.Size / 1gb) } },
-    @{ Name = 'FreeSpace (GB)' ; Expression = { '{0:N1}' -f ( $_.Freespace / 1gb ) } },
-    @{ Name = 'PercentFree' ; Expression = { '{0:P1}' -f ( $_.FreeSpace / $_.Size ) } } |
-        Format-Table -AutoSize | Out-String
+    $After = Get-WmiObject Win32_LogicalDisk |
+        Where-Object { $_.DriveType -eq '3' } |
+            Select-Object SystemName,
+            @{ Name = 'Drive'; Expression = { $_.DeviceID } },
+            @{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($_.Size / 1GB) } },
+            @{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($_.FreeSpace / 1GB) } },
+            @{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($_.FreeSpace / $_.Size) } } |
+                Format-Table -AutoSize |
+                    Out-String
 
-    # Sends some before and after info for ticketing purposes
+    # Report WinSxS and Installer folder sizes
+    $WinSxSPath = "$env:windir\WinSxS"
+    $InstallerPath = "$env:windir\Installer"
+
+    $WinSxSSizeBytes = Get-FolderSizeBytes -Path $WinSxSPath
+    $InstallerSizeBytes = Get-FolderSizeBytes -Path $InstallerPath
+
     Write-Host -ForegroundColor Green "Before: $Before"
     Write-Host -ForegroundColor Green "After: $After"
 
+    Write-Host -ForegroundColor Cyan "`nAdditional folder size report:"
+    Write-Host -ForegroundColor Cyan "$WinSxSPath size: $(Format-Size -Bytes $WinSxSSizeBytes)"
+    Write-Host -ForegroundColor Cyan "$InstallerPath size: $(Format-Size -Bytes $InstallerSizeBytes)"
+
+    Write-Host -ForegroundColor Yellow "`nDo NOT manually delete files from WinSxS or Installer."
+    Write-Host -ForegroundColor Yellow 'If WinSxS is large, consider running the following command from an elevated PowerShell or Command Prompt:'
+    Write-Host -ForegroundColor Yellow 'Dism.exe /Online /Cleanup-Image /StartComponentCleanup'
+    Write-Host -ForegroundColor Yellow "This can take some time, especially on older machines or servers.`n"
+
     # Another reminder about running Windows update if needed as it would get lost in all the scrolling text.
-    if ($CleanWU -eq 'Y') { 
-        Write-Host -ForegroundColor Yellow "`nPlease rerun Windows Update to pull down the latest updates. `n"
+    if ($CleanWU -eq 'Y') {
+        Write-Host -ForegroundColor Yellow "`nPlease rerun Windows Update to pull down the latest updates.`n"
     }
 
     # Read some of the output before going away
-    Start-Sleep -s 15
+    Start-Sleep -Seconds 15
 
-    # Completed Successfully!
     # Open Text File
-    Invoke-Item $Cleanuplog
+    Invoke-Item $CleanupLog
 
-    # Stop Script
+    # Stop Transcript
     Stop-Transcript
 }
 
-# Listing all files in C:\Temp\* recursively, using Force parameter displays hidden files.
-$TempItems = Get-ChildItem -Path 'C:\Temp\*' -Recurse -Force
-if ($TempItems.count -gt 1) {
-    Write-Warning 'There are files within C:\Temp, please verify that important files are out of this location'
-    $Cont = Read-Host 'Continue with the cleanup script [Y/N]'
-    if ($cont -eq 'Y') { 
-        Cleanup
-    }
-    else {
-        Write-Host 'Please check the files within C:\Temp before running the script again'
-        Start-Sleep -Seconds 5
-    }
-}
-else {
-    Cleanup
-}
+Cleanup
