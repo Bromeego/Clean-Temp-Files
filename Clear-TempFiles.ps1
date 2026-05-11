@@ -650,47 +650,59 @@ function Cleanup {
     }
 
     # Empty Recycle Bin
-    if ($CleanBin -eq 'Y') {
-        Write-Host -ForegroundColor Green "Cleaning Recycle Bin`n"
+if ($CleanBin -eq 'Y') {
+    Write-Host -ForegroundColor Green "Cleaning Recycle Bin`n"
 
-        $RecycleBin = "C:\`$Recycle.Bin"
-        $BinFolders = Get-ChildItem $RecycleBin -Directory -Force -ErrorAction SilentlyContinue
+    $RecycleBin = "C:\`$Recycle.Bin"
+    $BinFolders = Get-ChildItem $RecycleBin -Directory -Force -ErrorAction SilentlyContinue
 
-        foreach ($Folder in $BinFolders) {
-            # Translate the SID to a User Account
-            try {
-                $ObjSID = New-Object System.Security.Principal.SecurityIdentifier ($Folder.Name)
-                $ObjUser = $ObjSID.Translate([System.Security.Principal.NTAccount])
-                Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
-            }
-            catch {
-                $ObjUser = $Folder.Name
-                Write-Host -ForegroundColor Yellow -BackgroundColor Black "$ObjUser"
-            }
-
-            $Files = @()
-
-            if ($PSVersionTable.PSVersion.Major -eq 2) {
-                $Files = Get-ChildItem $Folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            else {
-                $Files = Get-ChildItem $Folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue
-                $Files += Get-ChildItem $Folder.FullName -Directory -Recurse -Force -ErrorAction SilentlyContinue
-            }
-
-            $FileTotal = $Files.Count
-
-            for ($i = 1; $i -le $Files.Count; $i++) {
-                $FileName = Select-Object -InputObject $Files[($i - 1)]
-                Write-Progress -Activity 'Recycle Bin Clean-up' -Status "Attempting to Delete File [$i / $FileTotal]: $FileName" -PercentComplete (($i / $Files.Count) * 100) -Id 1
-                Remove-Item -Path $Files[($i - 1)].FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-
-            Write-Progress -Activity 'Recycle Bin Clean-up' -Status 'Complete' -Completed -Id 1
+    foreach ($Folder in $BinFolders) {
+        # Translate the SID to a User Account
+        try {
+            $ObjSID = New-Object System.Security.Principal.SecurityIdentifier ($Folder.Name)
+            $ObjUser = $ObjSID.Translate([System.Security.Principal.NTAccount])
+            Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
+        }
+        catch {
+            $ObjUser = $Folder.Name
+            Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
         }
 
-        Write-Host -ForegroundColor Green "Done`n `n"
+        # Force array output so += does not fail when only one file is returned
+        $Files = @(
+            Get-ChildItem $Folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue
+        )
+
+        $Directories = @(
+            Get-ChildItem $Folder.FullName -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending
+        )
+
+        $ItemsToDelete = @($Files + $Directories)
+        $ItemTotal = $ItemsToDelete.Count
+
+        if ($ItemTotal -eq 0) {
+            Write-Host -ForegroundColor Cyan "Recycle Bin is already empty for $ObjUser`n"
+            continue
+        }
+
+        for ($i = 1; $i -le $ItemTotal; $i++) {
+            $Item = $ItemsToDelete[($i - 1)]
+
+            Write-Progress `
+                -Activity "Recycle Bin Clean-up" `
+                -Status "Attempting to Delete Item [$i / $ItemTotal]: $($Item.FullName)" `
+                -PercentComplete (($i / $ItemTotal) * 100) `
+                -Id 1
+
+            Remove-Item -Path $Item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Progress -Activity "Recycle Bin Clean-up" -Status "Complete" -Completed -Id 1
     }
+
+    Write-Host -ForegroundColor Green "Done`n `n"
+}
 
     Write-Host -ForegroundColor Green "All Tasks Done!`n`n"
 
