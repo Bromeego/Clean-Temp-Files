@@ -264,7 +264,7 @@ function Cleanup {
 
     if ($CacheOnly) {
         Write-Host -ForegroundColor Yellow 'CacheOnly mode: running browser and application cache cleanup only.'
-        Write-Host -ForegroundColor Yellow 'Destructive operations and system maintenance tasks are skipped.`n'
+        Write-Host -ForegroundColor Yellow "Destructive operations and system maintenance tasks are skipped.`n"
     }
 
     # Set Date for Log
@@ -851,7 +851,7 @@ function Cleanup {
 
     if ($Script:CleanupStats.Failed -gt 0) {
         Write-Host -ForegroundColor Yellow "`nCleanup completed with $($Script:CleanupStats.Failed) item(s) that could not be removed (locked, in use, or access denied)."
-        Write-Host -ForegroundColor Yellow 'Check the transcript log for verbose details.`n'
+        Write-Host -ForegroundColor Yellow "Check the transcript log for verbose details.`n"
     }
 
     # Read some of the output before going away
