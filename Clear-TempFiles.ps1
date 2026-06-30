@@ -237,7 +237,14 @@ if ((CheckAdmin) -eq $false) {
             $PowerShellCmdLine = 'powershell.exe'
         }
 
-        $CommandLine = "-NoProfile -ExecutionPolicy Bypass -File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments + ' -Elevated'
+        $CommandLine = "-NoProfile -ExecutionPolicy Bypass -File `"" + $MyInvocation.MyCommand.Path + "`" " + ($MyInvocation.UnboundArguments -join ' ')
+        if ($CacheOnly) {
+            $CommandLine += ' -CacheOnly'
+        }
+        if ($WhatIfPreference) {
+            $CommandLine += ' -WhatIf'
+        }
+        $CommandLine += ' -Elevated'
         Start-Process "$PSHOME\$PowerShellCmdLine" -Verb RunAs -ArgumentList $CommandLine
     }
 
@@ -862,4 +869,12 @@ function Cleanup {
     Stop-Transcript
 }
 
-Cleanup @PSBoundParameters
+$CleanupParameters = (Get-Command -Name Cleanup).Parameters
+$CleanupParams = @{}
+foreach ($ParameterName in $PSBoundParameters.Keys) {
+    if ($CleanupParameters.ContainsKey($ParameterName)) {
+        $CleanupParams[$ParameterName] = $PSBoundParameters[$ParameterName]
+    }
+}
+
+Cleanup @CleanupParams
