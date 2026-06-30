@@ -1,5 +1,40 @@
 # Calling PowerShell as Admin and setting Execution Policy to Bypass to avoid Cannot run Scripts error
-param ([switch]$Elevated)
+[CmdletBinding(SupportsShouldProcess = $true)]
+param (
+    [switch]$Elevated,
+
+    # Non-interactive mode: runs browser and application cache cleanup only (no prompts, no destructive ops)
+    [switch]$CacheOnly
+)
+
+$ScriptVersion = '2.9.0'
+
+$Script:Config = @{
+    DownloadsRetentionDays      = 90
+    InetLogRetentionDays        = 30
+    System32LogRetentionMonths  = 2
+    AzureLogRetentionDays       = 7
+    OfficeCacheRetentionDays    = 7
+    LFSAgentLogRetentionDays    = 30
+    SotiLogRetentionYears       = 1
+    CBSLogRetentionDays         = 14
+    PantherLogRetentionDays     = 30
+    FailedReqLogRetentionDays   = 30
+    CTempThresholdBytes         = 500MB
+    WUFolderThresholdBytes      = 1.5GB
+    CTempPath                   = 'C:\Temp'
+    ExcludedUsers               = @(
+        'Public',
+        'Default',
+        'Default User',
+        'All Users',
+        'defaultuser0'
+    )
+}
+
+$Script:CleanupStats = @{
+    Failed = 0
+}
 
 function CheckAdmin {
     $currentUser = New-Object Security.Principal.WindowsPrincipal $([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -14,6 +49,10 @@ function Ask-YesNo {
         [ValidateSet('Y', 'N')]
         [string]$Default = 'N'
     )
+
+    if ($script:NonInteractive) {
+        return $Default
+    }
 
     $Answer = Read-Host "$Question (Y/N) [Default: $Default]"
 
@@ -69,18 +108,33 @@ function Format-Size {
 }
 
 function Remove-FolderContents {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param (
         [Parameter(Mandatory = $true)]
         [string]$Path
     )
 
-    if (Test-Path $Path) {
-        Get-ChildItem -Path $Path -Force -ErrorAction SilentlyContinue |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    $Items = @(Get-ChildItem -Path $Path -Force -ErrorAction SilentlyContinue)
+
+    foreach ($Item in $Items) {
+        if ($PSCmdlet.ShouldProcess($Item.FullName, 'Remove')) {
+            try {
+                Remove-Item -Path $Item.FullName -Recurse -Force -ErrorAction Stop -Verbose
+            }
+            catch {
+                $Script:CleanupStats.Failed++
+                Write-Verbose "Failed to remove $($Item.FullName): $($_.Exception.Message)"
+            }
+        }
     }
 }
 
 function Remove-OldFiles {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param (
         [Parameter(Mandatory = $true)]
         [string]$Path,
@@ -121,13 +175,58 @@ function Remove-OldFiles {
     }
 
     foreach ($File in $Files) {
-        Remove-Item -Path $File.FullName -Force -ErrorAction SilentlyContinue -Verbose
+        if ($PSCmdlet.ShouldProcess($File.FullName, 'Remove')) {
+            try {
+                Remove-Item -Path $File.FullName -Force -ErrorAction Stop -Verbose
+            }
+            catch {
+                $Script:CleanupStats.Failed++
+                Write-Verbose "Failed to remove $($File.FullName): $($_.Exception.Message)"
+            }
+        }
     }
+}
+
+function Remove-ItemSafe {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [switch]$Recurse
+    )
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess($Path, 'Remove')) {
+        try {
+            Remove-Item -Path $Path -Recurse:$Recurse -Force -ErrorAction Stop -Verbose
+        }
+        catch {
+            $Script:CleanupStats.Failed++
+            Write-Verbose "Failed to remove ${Path}: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-DiskSpaceReport {
+    Get-CimInstance -ClassName Win32_LogicalDisk |
+        Where-Object { $_.DriveType -eq 3 } |
+            Select-Object SystemName,
+            @{ Name = 'Drive'; Expression = { $_.DeviceID } },
+            @{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($_.Size / 1GB) } },
+            @{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($_.FreeSpace / 1GB) } },
+            @{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($_.FreeSpace / $_.Size) } } |
+                Format-Table -AutoSize |
+                    Out-String
 }
 
 if ((CheckAdmin) -eq $false) {
     if ($Elevated) {
-        # Could not elevate, quit
+        Write-Error 'Administrator privileges are required. Elevation was denied or failed.'
+        exit 1
     }
     else {
         # Detecting PowerShell (powershell.exe) or PowerShell Core (pwsh)
@@ -149,36 +248,48 @@ if ((CheckAdmin) -eq $false) {
 $host.UI.RawUI.WindowTitle = 'Clean Temp Files'
 
 function Cleanup {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param ()
+    $script:NonInteractive = $CacheOnly.IsPresent
+    $Script:CleanupStats.Failed = 0
+
+    Write-Host -ForegroundColor Cyan "Clean Temp Files v$ScriptVersion`n"
+
+    if ($CacheOnly) {
+        Write-Host -ForegroundColor Yellow 'CacheOnly mode: running browser and application cache cleanup only.'
+        Write-Host -ForegroundColor Yellow 'Destructive operations and system maintenance tasks are skipped.`n'
+    }
+
     # Set Date for Log
     $LogDate = Get-Date -Format 'MM-d-yy-HHmm'
 
-    # Set Deletion Dates
-    $DelDownloadsDate = (Get-Date).AddDays(-90)
-    $DelInetLogDate = (Get-Date).AddDays(-30)
-    $System32LogDate = (Get-Date).AddMonths(-2)
-    $DelAZLogDate = (Get-Date).AddDays(-7)
-    $DelOfficeCacheDate = (Get-Date).AddDays(-7)
-    $DelLFSAgentLogDate = (Get-Date).AddDays(-30)
-    $DelSotiLogDate = (Get-Date).AddYears(-1)
-    $DelCBSLogDate = (Get-Date).AddDays(-14)
-    $DelPantherLogDate = (Get-Date).AddDays(-30)
-    $DelFailedReqLogDate = (Get-Date).AddDays(-30)
+    # Set Deletion Dates from configuration
+    $DelDownloadsDate = (Get-Date).AddDays(-$Script:Config.DownloadsRetentionDays)
+    $DelInetLogDate = (Get-Date).AddDays(-$Script:Config.InetLogRetentionDays)
+    $System32LogDate = (Get-Date).AddMonths(-$Script:Config.System32LogRetentionMonths)
+    $DelAZLogDate = (Get-Date).AddDays(-$Script:Config.AzureLogRetentionDays)
+    $DelOfficeCacheDate = (Get-Date).AddDays(-$Script:Config.OfficeCacheRetentionDays)
+    $DelLFSAgentLogDate = (Get-Date).AddDays(-$Script:Config.LFSAgentLogRetentionDays)
+    $DelSotiLogDate = (Get-Date).AddYears(-$Script:Config.SotiLogRetentionYears)
+    $DelCBSLogDate = (Get-Date).AddDays(-$Script:Config.CBSLogRetentionDays)
+    $DelPantherLogDate = (Get-Date).AddDays(-$Script:Config.PantherLogRetentionDays)
+    $DelFailedReqLogDate = (Get-Date).AddDays(-$Script:Config.FailedReqLogRetentionDays)
+    $CTempPath = $Script:Config.CTempPath
 
     # Prompt options
-    $DeleteOldDownloads = Ask-YesNo -Question 'Would you like to delete files older than 90 days in the Downloads folder for All Users?' -Default 'N'
+    $DeleteOldDownloads = Ask-YesNo -Question "Would you like to delete files older than $($Script:Config.DownloadsRetentionDays) days in the Downloads folder for All Users?" -Default 'N'
     $CleanBin = Ask-YesNo -Question 'Would you like to empty the Recycle Bin for All Users?' -Default 'N'
     $CloseBrowsers = Ask-YesNo -Question 'Would you like to close Edge/Chrome/Firefox before cleaning browser cache?' -Default 'N'
     $CleanPrintSpooler = Ask-YesNo -Question 'Would you like to clear the print spooler queue? This will remove stuck print jobs' -Default 'N'
 
-    # C:\Temp handling. Only ask if the folder exists and is larger than 500MB.
+    # C:\Temp handling. Only ask if the folder exists and is larger than the configured threshold.
     $CleanCTemp = 'N'
-    $CTempPath = 'C:\Temp'
 
     if (Test-Path $CTempPath) {
         $CTempSizeBytes = Get-FolderSizeBytes -Path $CTempPath
         $CTempSizeFormatted = Format-Size -Bytes $CTempSizeBytes
 
-        if ($CTempSizeBytes -gt 500MB) {
+        if ($CTempSizeBytes -gt $Script:Config.CTempThresholdBytes) {
             Write-Host -ForegroundColor Yellow "$CTempPath currently contains approximately $CTempSizeFormatted."
             $CleanCTemp = Ask-YesNo -Question "Would you like to clean $CTempPath?" -Default 'N'
         }
@@ -196,7 +307,7 @@ function Cleanup {
     if (Test-Path "$env:windir\SoftwareDistribution") {
         $WUFolderSizeBytes = Get-FolderSizeBytes -Path "$env:windir\SoftwareDistribution"
 
-        if ($WUFolderSizeBytes -gt 1.5GB) {
+        if ($WUFolderSizeBytes -gt $Script:Config.WUFolderThresholdBytes) {
             Write-Host "The Windows Update folder is $(Format-Size -Bytes $WUFolderSizeBytes)"
             $CleanWU = Ask-YesNo -Question 'Do you want to clean the Software Distribution folder and reset Windows Updates?' -Default 'N'
         }
@@ -213,15 +324,7 @@ function Cleanup {
     }
 
     # Get Disk Size Before
-    $Before = Get-WmiObject Win32_LogicalDisk |
-        Where-Object { $_.DriveType -eq '3' } |
-            Select-Object SystemName,
-            @{ Name = 'Drive'; Expression = { $_.DeviceID } },
-            @{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($_.Size / 1GB) } },
-            @{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($_.FreeSpace / 1GB) } },
-            @{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($_.FreeSpace / $_.Size) } } |
-                Format-Table -AutoSize |
-                    Out-String
+    $Before = Get-DiskSpaceReport
 
     # Define log file location
     $CleanupLog = "$env:USERPROFILE\Cleanup$LogDate.log"
@@ -232,13 +335,7 @@ function Cleanup {
     # Create list of users
     Write-Host -ForegroundColor Green "Getting the list of Users`n"
 
-    $ExcludedUsers = @(
-        'Public',
-        'Default',
-        'Default User',
-        'All Users',
-        'defaultuser0'
-    )
+    $ExcludedUsers = $Script:Config.ExcludedUsers
 
     $Users = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
         Where-Object { $ExcludedUsers -notcontains $_.Name } |
@@ -382,6 +479,16 @@ function Cleanup {
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
+    # Clear Delivery Optimization Cache
+    $DeliveryOptimizationPath = "$env:windir\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
+
+    if (Test-Path $DeliveryOptimizationPath) {
+        Write-Host -ForegroundColor Yellow "Clearing Delivery Optimization Cache`n"
+        Remove-FolderContents -Path $DeliveryOptimizationPath
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    if (-not $CacheOnly) {
     # Clear User Temp Folders
     Write-Host -ForegroundColor Yellow "Clearing User Temp Folders`n"
     foreach ($User in $Users) {
@@ -413,7 +520,7 @@ function Cleanup {
 
     # CBS logs can be actively used, so only delete older files.
     if (Test-Path "$env:windir\Logs\CBS") {
-        Write-Host -ForegroundColor Yellow "Deleting CBS logs older than 14 days`n"
+        Write-Host -ForegroundColor Yellow "Deleting CBS logs older than $($Script:Config.CBSLogRetentionDays) days`n"
         Remove-OldFiles -Path "$env:windir\Logs\CBS" -OlderThan $DelCBSLogDate -Recurse
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
@@ -423,18 +530,9 @@ function Cleanup {
 
     Write-Host -ForegroundColor Yellow "Done...`n"
 
-    # Clear Delivery Optimization Cache
-    $DeliveryOptimizationPath = "$env:windir\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
-
-    if (Test-Path $DeliveryOptimizationPath) {
-        Write-Host -ForegroundColor Yellow "Clearing Delivery Optimization Cache`n"
-        Remove-FolderContents -Path $DeliveryOptimizationPath
-        Write-Host -ForegroundColor Yellow "Done...`n"
-    }
-
     # Clear Windows memory dump files
     Write-Host -ForegroundColor Yellow "Clearing Windows memory dump files`n"
-    Remove-Item -Path "$env:windir\MEMORY.DMP" -Force -ErrorAction SilentlyContinue -Verbose
+    Remove-ItemSafe -Path "$env:windir\MEMORY.DMP"
     Remove-FolderContents -Path "$env:windir\Minidump"
     Write-Host -ForegroundColor Yellow "Done...`n"
 
@@ -466,6 +564,7 @@ function Cleanup {
         Write-Host -ForegroundColor Yellow "Clearing IIS Failed Request Logs older than 30 days`n"
         Remove-OldFiles -Path 'C:\inetpub\logs\FailedReqLogFiles' -OlderThan $DelFailedReqLogDate -Recurse
         Write-Host -ForegroundColor Yellow "Done...`n"
+    }
     }
 
     # Delete Microsoft Teams Previous Version files
@@ -499,10 +598,37 @@ function Cleanup {
     }
     Write-Host -ForegroundColor Yellow "Done...`n"
 
+    # Delete files older than 90 days from Downloads folder
+    if ($DeleteOldDownloads -eq 'Y') {
+        Write-Host -ForegroundColor Yellow "Deleting files older than $($Script:Config.DownloadsRetentionDays) days from User Downloads folder`n"
+
+        foreach ($User in $Users) {
+            $UserDownloads = "C:\Users\$User\Downloads"
+
+            if (Test-Path $UserDownloads) {
+                Remove-OldFiles -Path $UserDownloads -OlderThan $DelDownloadsDate -Recurse
+            }
+        }
+
+        Write-Host -ForegroundColor Yellow "Done...`n"
+    }
+
+    # Delete files older than 7 days from Office Cache Folder
+    Write-Host -ForegroundColor Yellow "Clearing Office Cache Folder`n"
+    foreach ($User in $Users) {
+        $OfficeCache = "C:\Users\$User\AppData\Local\Microsoft\Office\16.0\GrooveFileCache"
+
+        if (Test-Path $OfficeCache) {
+            Remove-OldFiles -Path $OfficeCache -OlderThan $DelOfficeCacheDate -Recurse
+        }
+    }
+    Write-Host -ForegroundColor Yellow "Done...`n"
+
+    if (-not $CacheOnly) {
     # Clear HP Support Assistant Installation Folder
     if (Test-Path 'C:\swsetup') {
         Write-Host -ForegroundColor Yellow "Clearing HP Support Assistant Installation Folder C:\swsetup`n"
-        Remove-Item -Path 'C:\swsetup' -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+        Remove-ItemSafe -Path 'C:\swsetup' -Recurse
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
 
@@ -518,38 +644,12 @@ function Cleanup {
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
 
-    # Delete files older than 90 days from Downloads folder
-    if ($DeleteOldDownloads -eq 'Y') {
-        Write-Host -ForegroundColor Yellow "Deleting files older than 90 days from User Downloads folder`n"
-
-        foreach ($User in $Users) {
-            $UserDownloads = "C:\Users\$User\Downloads"
-
-            if (Test-Path $UserDownloads) {
-                Remove-OldFiles -Path $UserDownloads -OlderThan $DelDownloadsDate -Recurse
-            }
-        }
-
-        Write-Host -ForegroundColor Yellow "Done...`n"
-    }
-
     # Delete files older than 7 days from Azure Log folder
     if (Test-Path 'C:\WindowsAzure\Logs') {
         Write-Host -ForegroundColor Yellow "Deleting files older than 7 days from Azure Log folder`n"
         Remove-OldFiles -Path 'C:\WindowsAzure\Logs' -OlderThan $DelAZLogDate -Recurse
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
-
-    # Delete files older than 7 days from Office Cache Folder
-    Write-Host -ForegroundColor Yellow "Clearing Office Cache Folder`n"
-    foreach ($User in $Users) {
-        $OfficeCache = "C:\Users\$User\AppData\Local\Microsoft\Office\16.0\GrooveFileCache"
-
-        if (Test-Path $OfficeCache) {
-            Remove-OldFiles -Path $OfficeCache -OlderThan $DelOfficeCacheDate -Recurse
-        }
-    }
-    Write-Host -ForegroundColor Yellow "Done...`n"
 
     # Delete files older than 30 days from LFSAgent Log folder https://www.lepide.com/
     if (Test-Path "$env:windir\LFSAgent\Logs") {
@@ -588,6 +688,7 @@ function Cleanup {
 
         Write-Host -ForegroundColor Yellow "Done...`n"
     }
+    }
 
     # Clear print spooler queue if requested
     if ($CleanPrintSpooler -eq 'Y') {
@@ -617,7 +718,7 @@ function Cleanup {
     if ($CleanWindowsOld -eq 'Y') {
         if (Test-Path 'C:\Windows.old') {
             Write-Host -ForegroundColor Yellow "Deleting C:\Windows.old`n"
-            Remove-Item -Path 'C:\Windows.old' -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+            Remove-ItemSafe -Path 'C:\Windows.old' -Recurse
             Write-Host -ForegroundColor Yellow "Done...`n"
         }
     }
@@ -634,7 +735,7 @@ function Cleanup {
             Write-Warning "$ErrorMessage"
         }
 
-        Remove-Item "$env:windir\SoftwareDistribution" -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+        Remove-ItemSafe -Path "$env:windir\SoftwareDistribution" -Recurse
         Start-Sleep -Seconds 3
 
         try {
@@ -650,72 +751,72 @@ function Cleanup {
     }
 
     # Empty Recycle Bin
-if ($CleanBin -eq 'Y') {
-    Write-Host -ForegroundColor Green "Cleaning Recycle Bin`n"
+    if ($CleanBin -eq 'Y') {
+        Write-Host -ForegroundColor Green "Cleaning Recycle Bin`n"
 
-    $RecycleBin = "C:\`$Recycle.Bin"
-    $BinFolders = Get-ChildItem $RecycleBin -Directory -Force -ErrorAction SilentlyContinue
+        $RecycleBin = "C:\`$Recycle.Bin"
+        $BinFolders = Get-ChildItem $RecycleBin -Directory -Force -ErrorAction SilentlyContinue
 
-    foreach ($Folder in $BinFolders) {
-        # Translate the SID to a User Account
-        try {
-            $ObjSID = New-Object System.Security.Principal.SecurityIdentifier ($Folder.Name)
-            $ObjUser = $ObjSID.Translate([System.Security.Principal.NTAccount])
-            Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
+        foreach ($Folder in $BinFolders) {
+            # Translate the SID to a User Account
+            try {
+                $ObjSID = New-Object System.Security.Principal.SecurityIdentifier ($Folder.Name)
+                $ObjUser = $ObjSID.Translate([System.Security.Principal.NTAccount])
+                Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
+            }
+            catch {
+                $ObjUser = $Folder.Name
+                Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
+            }
+
+            # Force array output so += does not fail when only one file is returned
+            $Files = @(
+                Get-ChildItem $Folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue
+            )
+
+            $Directories = @(
+                Get-ChildItem $Folder.FullName -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+                    Sort-Object FullName -Descending
+            )
+
+            $ItemsToDelete = @($Files + $Directories)
+            $ItemTotal = $ItemsToDelete.Count
+
+            if ($ItemTotal -eq 0) {
+                Write-Host -ForegroundColor Cyan "Recycle Bin is already empty for $ObjUser`n"
+                continue
+            }
+
+            for ($i = 1; $i -le $ItemTotal; $i++) {
+                $Item = $ItemsToDelete[($i - 1)]
+
+                Write-Progress `
+                    -Activity "Recycle Bin Clean-up" `
+                    -Status "Attempting to Delete Item [$i / $ItemTotal]: $($Item.FullName)" `
+                    -PercentComplete (($i / $ItemTotal) * 100) `
+                    -Id 1
+
+                if ($PSCmdlet.ShouldProcess($Item.FullName, 'Remove')) {
+                    try {
+                        Remove-Item -Path $Item.FullName -Recurse -Force -ErrorAction Stop
+                    }
+                    catch {
+                        $Script:CleanupStats.Failed++
+                        Write-Verbose "Failed to remove $($Item.FullName): $($_.Exception.Message)"
+                    }
+                }
+            }
+
+            Write-Progress -Activity "Recycle Bin Clean-up" -Status "Complete" -Completed -Id 1
         }
-        catch {
-            $ObjUser = $Folder.Name
-            Write-Host -ForegroundColor Yellow -BackgroundColor Black "Cleaning $ObjUser Recycle Bin"
-        }
 
-        # Force array output so += does not fail when only one file is returned
-        $Files = @(
-            Get-ChildItem $Folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue
-        )
-
-        $Directories = @(
-            Get-ChildItem $Folder.FullName -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-                Sort-Object FullName -Descending
-        )
-
-        $ItemsToDelete = @($Files + $Directories)
-        $ItemTotal = $ItemsToDelete.Count
-
-        if ($ItemTotal -eq 0) {
-            Write-Host -ForegroundColor Cyan "Recycle Bin is already empty for $ObjUser`n"
-            continue
-        }
-
-        for ($i = 1; $i -le $ItemTotal; $i++) {
-            $Item = $ItemsToDelete[($i - 1)]
-
-            Write-Progress `
-                -Activity "Recycle Bin Clean-up" `
-                -Status "Attempting to Delete Item [$i / $ItemTotal]: $($Item.FullName)" `
-                -PercentComplete (($i / $ItemTotal) * 100) `
-                -Id 1
-
-            Remove-Item -Path $Item.FullName -Recurse -Force -ErrorAction SilentlyContinue
-        }
-
-        Write-Progress -Activity "Recycle Bin Clean-up" -Status "Complete" -Completed -Id 1
+        Write-Host -ForegroundColor Green "Done`n `n"
     }
-
-    Write-Host -ForegroundColor Green "Done`n `n"
-}
 
     Write-Host -ForegroundColor Green "All Tasks Done!`n`n"
 
     # Get Drive size after clean
-    $After = Get-WmiObject Win32_LogicalDisk |
-        Where-Object { $_.DriveType -eq '3' } |
-            Select-Object SystemName,
-            @{ Name = 'Drive'; Expression = { $_.DeviceID } },
-            @{ Name = 'Size (GB)'; Expression = { '{0:N1}' -f ($_.Size / 1GB) } },
-            @{ Name = 'FreeSpace (GB)'; Expression = { '{0:N1}' -f ($_.FreeSpace / 1GB) } },
-            @{ Name = 'PercentFree'; Expression = { '{0:P1}' -f ($_.FreeSpace / $_.Size) } } |
-                Format-Table -AutoSize |
-                    Out-String
+    $After = Get-DiskSpaceReport
 
     # Report WinSxS and Installer folder sizes
     $WinSxSPath = "$env:windir\WinSxS"
@@ -741,14 +842,24 @@ if ($CleanBin -eq 'Y') {
         Write-Host -ForegroundColor Yellow "`nPlease rerun Windows Update to pull down the latest updates.`n"
     }
 
-    # Read some of the output before going away
-    Start-Sleep -Seconds 15
+    if ($Script:CleanupStats.Failed -gt 0) {
+        Write-Host -ForegroundColor Yellow "`nCleanup completed with $($Script:CleanupStats.Failed) item(s) that could not be removed (locked, in use, or access denied)."
+        Write-Host -ForegroundColor Yellow 'Check the transcript log for verbose details.`n'
+    }
 
-    # Open Text File
-    Invoke-Item $CleanupLog
+    # Read some of the output before going away
+    if (-not $CacheOnly) {
+        Start-Sleep -Seconds 15
+
+        # Open Text File
+        Invoke-Item $CleanupLog
+    }
+    else {
+        Write-Host -ForegroundColor Cyan "Transcript saved to: $CleanupLog"
+    }
 
     # Stop Transcript
     Stop-Transcript
 }
 
-Cleanup
+Cleanup @PSBoundParameters
